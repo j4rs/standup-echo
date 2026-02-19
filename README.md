@@ -21,7 +21,15 @@ A Slack bot that DMs each user their previous standup reply when a new standup t
 
 ## Installation
 
-### Homebrew
+### Linux (one-liner)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/j4rs/standup-echo/main/install.sh | sudo bash
+```
+
+Installs Go and Git if needed, builds the binary to `/usr/local/bin`, and creates a systemd service.
+
+### Homebrew (macOS)
 
 ```bash
 brew tap j4rs/tools
