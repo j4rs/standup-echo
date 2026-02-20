@@ -114,6 +114,85 @@ func (s *Service) SendDMs(threadDate time.Time, replies map[string]string) error
 	return nil
 }
 
+// FindStandupThread scans channel history for a standup thread matching the
+// thread identifier. If date is non-zero, it finds the thread posted on that
+// date. Otherwise it returns the most recent one.
+func (s *Service) FindStandupThread(date time.Time) (string, error) {
+	filterByDate := !date.IsZero()
+	cursor := ""
+	for {
+		params := &slack.GetConversationHistoryParameters{
+			ChannelID: s.channelID,
+			Limit:     100,
+			Cursor:    cursor,
+		}
+		history, err := s.client.GetConversationHistory(params)
+		if err != nil {
+			return "", fmt.Errorf("fetching channel history: %w", err)
+		}
+
+		for _, msg := range history.Messages {
+			if !strings.Contains(msg.Text, s.threadIdentifier) {
+				continue
+			}
+			if filterByDate {
+				msgDate := tsToTime(msg.Timestamp)
+				y1, m1, d1 := msgDate.Date()
+				y2, m2, d2 := date.Date()
+				if y1 != y2 || m1 != m2 || d1 != d2 {
+					continue
+				}
+			}
+			s.logger.Info("found standup thread", "ts", msg.Timestamp)
+			return msg.Timestamp, nil
+		}
+
+		if !history.HasMore {
+			break
+		}
+		cursor = history.ResponseMetaData.NextCursor
+	}
+
+	return "", fmt.Errorf("no standup thread found")
+}
+
+// ProcessLatestStandup finds a standup thread, gets replies, and sends DMs.
+// If onlyUser is non-empty, only that user will receive a DM.
+// If date is non-zero, it finds the thread for that specific date.
+func (s *Service) ProcessLatestStandup(onlyUser string, date time.Time) {
+	s.logger.Info("processing standup thread", "only_user", onlyUser, "date", date)
+
+	threadTS, err := s.FindStandupThread(date)
+	if err != nil {
+		s.logger.Error("no standup thread found", "error", err)
+		return
+	}
+
+	replies, err := s.GetThreadReplies(threadTS)
+	if err != nil {
+		s.logger.Error("failed to get thread replies", "error", err)
+		return
+	}
+
+	if onlyUser != "" {
+		if reply, ok := replies[onlyUser]; ok {
+			replies = map[string]string{onlyUser: reply}
+		} else {
+			s.logger.Info("user has no reply in latest thread", "user", onlyUser)
+			return
+		}
+	}
+	if len(replies) == 0 {
+		s.logger.Info("no replies in standup thread")
+		return
+	}
+
+	threadDate := tsToTime(threadTS)
+	if err := s.SendDMs(threadDate, replies); err != nil {
+		s.logger.Error("failed to send DMs", "error", err)
+	}
+}
+
 // ProcessNewStandup is the orchestrator: find previous thread, get replies, send DMs.
 func (s *Service) ProcessNewStandup(newThreadTS string) {
 	s.logger.Info("processing new standup thread", "ts", newThreadTS)
