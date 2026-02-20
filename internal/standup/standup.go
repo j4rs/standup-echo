@@ -101,7 +101,7 @@ func (s *Service) SendDMs(threadDate time.Time, replies map[string]string) error
 		}
 		today := time.Now().Format("Monday, January 2")
 		text := fmt.Sprintf(
-			"📋 %s\n---\n%s\n\n✏️ %s\n---\n",
+			"*%s*\n---\n%s\n\n---\n*%s*\n",
 			dateStr, reply, today,
 		)
 		_, _, err := s.client.PostMessage(userID, slack.MsgOptionText(text, false))
