@@ -42,3 +42,33 @@ func TestTsToTime(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildDMText(t *testing.T) {
+	t.Run("includes spacing and thread link", func(t *testing.T) {
+		got := buildDMText(
+			"Monday, February 24",
+			"Wednesday, February 25",
+			"(a) Completed: finished ticket",
+			"https://example.slack.com/archives/C123/p1740000000000100",
+		)
+
+		want := "*Monday, February 24*\n---\n\n(a) Completed: finished ticket\n\n---\n*Wednesday, February 25*\n\n<https://example.slack.com/archives/C123/p1740000000000100|Open today's standup thread>\n"
+		if got != want {
+			t.Fatalf("buildDMText() mismatch\nwant:\n%q\ngot:\n%q", want, got)
+		}
+	})
+
+	t.Run("omits thread link when empty", func(t *testing.T) {
+		got := buildDMText(
+			"Monday, February 24",
+			"Wednesday, February 25",
+			"(a) Completed: finished ticket",
+			"",
+		)
+
+		want := "*Monday, February 24*\n---\n\n(a) Completed: finished ticket\n\n---\n*Wednesday, February 25*\n"
+		if got != want {
+			t.Fatalf("buildDMText() mismatch\nwant:\n%q\ngot:\n%q", want, got)
+		}
+	})
+}
