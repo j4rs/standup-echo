@@ -91,8 +91,7 @@ func (s *Service) GetThreadReplies(threadTS string) (map[string]string, error) {
 }
 
 // SendDMs sends each user their previous standup reply via direct message.
-func (s *Service) SendDMs(threadDate time.Time, replies map[string]string, newThreadTS string) error {
-	dateStr := threadDate.Format("Monday, January 2")
+func (s *Service) SendDMs(replies map[string]string, newThreadTS string) error {
 	today := time.Now().Format("Monday, January 2")
 	newThreadLink := s.getThreadPermalink(newThreadTS)
 
@@ -101,7 +100,7 @@ func (s *Service) SendDMs(threadDate time.Time, replies map[string]string, newTh
 			s.logger.Debug("skipping non-subscribed user", "user", userID)
 			continue
 		}
-		text := buildDMText(dateStr, today, reply, newThreadLink)
+		text := buildDMText(today, reply, newThreadLink)
 		_, _, err := s.client.PostMessage(userID, slack.MsgOptionText(text, false))
 		if err != nil {
 			s.logger.Error("failed to DM user", "user", userID, "error", err)
@@ -129,16 +128,20 @@ func (s *Service) getThreadPermalink(threadTS string) string {
 	return link
 }
 
-func buildDMText(previousDate, todayDate, reply, threadLink string) string {
-	text := fmt.Sprintf(
-		"*%s*\n---\n\n%s\n\n---\n*%s*\n",
-		previousDate, reply, todayDate,
-	)
+func buildDMText(todayDate, reply, threadLink string) string {
+	trimmedReply := strings.TrimSpace(reply)
+	todayPrompt := fmt.Sprintf("%s\nWhat are you up to today?", todayDate)
+
+	text := todayPrompt
+	if trimmedReply != "" {
+		text = fmt.Sprintf("%s\n\n%s", trimmedReply, todayPrompt)
+	}
+
 	if threadLink == "" {
 		return text
 	}
 
-	return fmt.Sprintf("%s\n<%s|Open today's standup thread>\n", text, threadLink)
+	return fmt.Sprintf("%s\n\n<%s|Open today's standup thread>", text, threadLink)
 }
 
 // FindStandupThread scans channel history for a standup thread matching the
@@ -214,8 +217,7 @@ func (s *Service) ProcessLatestStandup(onlyUser string, date time.Time) {
 		return
 	}
 
-	threadDate := tsToTime(threadTS)
-	if err := s.SendDMs(threadDate, replies, threadTS); err != nil {
+	if err := s.SendDMs(replies, threadTS); err != nil {
 		s.logger.Error("failed to send DMs", "error", err)
 	}
 }
@@ -240,8 +242,7 @@ func (s *Service) ProcessNewStandup(newThreadTS string) {
 		return
 	}
 
-	threadDate := tsToTime(prevTS)
-	if err := s.SendDMs(threadDate, replies, newThreadTS); err != nil {
+	if err := s.SendDMs(replies, newThreadTS); err != nil {
 		s.logger.Error("failed to send DMs", "error", err)
 	}
 }

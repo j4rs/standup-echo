@@ -44,15 +44,14 @@ func TestTsToTime(t *testing.T) {
 }
 
 func TestBuildDMText(t *testing.T) {
-	t.Run("includes spacing and thread link", func(t *testing.T) {
+	t.Run("keeps previous entries and appends today's prompt with thread link", func(t *testing.T) {
 		got := buildDMText(
-			"Monday, February 24",
 			"Wednesday, February 25",
-			"(a) Completed: finished ticket",
+			"Tuesday, February 24\n:construction: Continue with ticket\n\nWednesday, February 25\n:blocker: Review PR",
 			"https://example.slack.com/archives/C123/p1740000000000100",
 		)
 
-		want := "*Monday, February 24*\n---\n\n(a) Completed: finished ticket\n\n---\n*Wednesday, February 25*\n\n<https://example.slack.com/archives/C123/p1740000000000100|Open today's standup thread>\n"
+		want := "Tuesday, February 24\n:construction: Continue with ticket\n\nWednesday, February 25\n:blocker: Review PR\n\nWednesday, February 25\nWhat are you up to today?\n\n<https://example.slack.com/archives/C123/p1740000000000100|Open today's standup thread>"
 		if got != want {
 			t.Fatalf("buildDMText() mismatch\nwant:\n%q\ngot:\n%q", want, got)
 		}
@@ -60,13 +59,25 @@ func TestBuildDMText(t *testing.T) {
 
 	t.Run("omits thread link when empty", func(t *testing.T) {
 		got := buildDMText(
-			"Monday, February 24",
 			"Wednesday, February 25",
 			"(a) Completed: finished ticket",
 			"",
 		)
 
-		want := "*Monday, February 24*\n---\n\n(a) Completed: finished ticket\n\n---\n*Wednesday, February 25*\n"
+		want := "(a) Completed: finished ticket\n\nWednesday, February 25\nWhat are you up to today?"
+		if got != want {
+			t.Fatalf("buildDMText() mismatch\nwant:\n%q\ngot:\n%q", want, got)
+		}
+	})
+
+	t.Run("handles empty previous reply", func(t *testing.T) {
+		got := buildDMText(
+			"Wednesday, February 25",
+			"",
+			"",
+		)
+
+		want := "Wednesday, February 25\nWhat are you up to today?"
 		if got != want {
 			t.Fatalf("buildDMText() mismatch\nwant:\n%q\ngot:\n%q", want, got)
 		}
