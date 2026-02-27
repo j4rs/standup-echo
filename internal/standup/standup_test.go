@@ -51,7 +51,7 @@ func TestBuildDMText(t *testing.T) {
 			"https://example.slack.com/archives/C123/p1740000000000100",
 		)
 
-		want := "Tuesday, February 24\n:construction: Continue with ticket\n\nWednesday, February 25\n:blocker: Review PR\n\nWednesday, February 25\nWhat are you up to today?\n\n<https://example.slack.com/archives/C123/p1740000000000100|Open today's standup thread>"
+		want := "*Tuesday, February 24*\n:construction: Continue with ticket\n\n*Wednesday, February 25*\n:blocker: Review PR\n\n*Wednesday, February 25*\nWhat are you up to today?\n\n<https://example.slack.com/archives/C123/p1740000000000100|Open today's standup thread>"
 		if got != want {
 			t.Fatalf("buildDMText() mismatch\nwant:\n%q\ngot:\n%q", want, got)
 		}
@@ -64,7 +64,7 @@ func TestBuildDMText(t *testing.T) {
 			"",
 		)
 
-		want := "(a) Completed: finished ticket\n\nWednesday, February 25\nWhat are you up to today?"
+		want := "(a) Completed: finished ticket\n\n*Wednesday, February 25*\nWhat are you up to today?"
 		if got != want {
 			t.Fatalf("buildDMText() mismatch\nwant:\n%q\ngot:\n%q", want, got)
 		}
@@ -77,7 +77,7 @@ func TestBuildDMText(t *testing.T) {
 			"",
 		)
 
-		want := "Wednesday, February 25\nWhat are you up to today?"
+		want := "*Wednesday, February 25*\nWhat are you up to today?"
 		if got != want {
 			t.Fatalf("buildDMText() mismatch\nwant:\n%q\ngot:\n%q", want, got)
 		}

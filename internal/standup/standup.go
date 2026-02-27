@@ -3,6 +3,7 @@ package standup
 import (
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
@@ -130,11 +131,12 @@ func (s *Service) getThreadPermalink(threadTS string) string {
 
 func buildDMText(todayDate, reply, threadLink string) string {
 	trimmedReply := strings.TrimSpace(reply)
-	todayPrompt := fmt.Sprintf("%s\nWhat are you up to today?", todayDate)
+	formattedReply := boldDateLines(trimmedReply)
+	todayPrompt := fmt.Sprintf("*%s*\nWhat are you up to today?", todayDate)
 
 	text := todayPrompt
-	if trimmedReply != "" {
-		text = fmt.Sprintf("%s\n\n%s", trimmedReply, todayPrompt)
+	if formattedReply != "" {
+		text = fmt.Sprintf("%s\n\n%s", formattedReply, todayPrompt)
 	}
 
 	if threadLink == "" {
@@ -142,6 +144,35 @@ func buildDMText(todayDate, reply, threadLink string) string {
 	}
 
 	return fmt.Sprintf("%s\n\n<%s|Open today's standup thread>", text, threadLink)
+}
+
+var dateLineRegex = regexp.MustCompile(`^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), (January|February|March|April|May|June|July|August|September|October|November|December) [0-9]{1,2}$`)
+
+func boldDateLines(text string) string {
+	if text == "" {
+		return ""
+	}
+
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		if isBoldDateLine(line) {
+			continue
+		}
+		if dateLineRegex.MatchString(line) {
+			lines[i] = fmt.Sprintf("*%s*", line)
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func isBoldDateLine(line string) bool {
+	if !strings.HasPrefix(line, "*") || !strings.HasSuffix(line, "*") {
+		return false
+	}
+
+	inner := strings.TrimSuffix(strings.TrimPrefix(line, "*"), "*")
+	return dateLineRegex.MatchString(inner)
 }
 
 // FindStandupThread scans channel history for a standup thread matching the
