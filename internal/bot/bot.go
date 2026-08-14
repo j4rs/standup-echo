@@ -13,11 +13,19 @@ import (
 	"github.com/slack-go/slack/socketmode"
 )
 
+// watcher pairs a configured channel with the standup service scoped to it.
+type watcher struct {
+	cfg     config.ChannelConfig
+	service *standup.Service
+}
+
 // Bot listens for new standup threads via Socket Mode and triggers DM delivery.
+// One Bot serves every configured channel, so teams with different channels and
+// different standup wording share a single process and Slack app.
 type Bot struct {
 	client      *slack.Client
 	handler     *socketmode.SocketmodeHandler
-	standup     *standup.Service
+	watchers    map[string]*watcher
 	subscribers *store.Subscribers
 	config      *config.Config
 	logger      *slog.Logger
@@ -33,12 +41,21 @@ func New(cfg *config.Config, subscribers *store.Subscribers, logger *slog.Logger
 	sm := socketmode.New(api)
 	handler := socketmode.NewSocketmodeHandler(sm)
 
-	svc := standup.NewService(api, cfg.ChannelID, cfg.ThreadIdentifier, subscribers, logger)
+	watchers := make(map[string]*watcher, len(cfg.Channels))
+	for _, ch := range cfg.Channels {
+		watchers[ch.ChannelID] = &watcher{
+			cfg: ch,
+			service: standup.NewService(
+				api, ch.ChannelID, ch.ThreadIdentifier, subscribers,
+				logger.With("channel", ch.Label()),
+			),
+		}
+	}
 
 	b := &Bot{
 		client:      api,
 		handler:     handler,
-		standup:     svc,
+		watchers:    watchers,
 		subscribers: subscribers,
 		config:      cfg,
 		logger:      logger,
@@ -57,6 +74,13 @@ func (b *Bot) Run() error {
 	}
 	b.botUserID = auth.UserID
 	b.logger.Info("authenticated", "bot_user_id", b.botUserID)
+
+	for _, w := range b.watchers {
+		b.logger.Info("watching channel",
+			"channel", w.cfg.Label(),
+			"channel_id", w.cfg.ChannelID,
+			"thread_identifier", w.cfg.ThreadIdentifier)
+	}
 
 	b.logger.Info("starting socket mode connection")
 	if err := b.handler.RunEventLoop(); err != nil {
@@ -98,25 +122,27 @@ func (b *Bot) handleMessageEvent(evt *socketmode.Event, client *socketmode.Clien
 	if ev.SubType != "" && ev.SubType != "bot_message" {
 		return
 	}
-	if ev.Channel != b.config.ChannelID {
+	w, watched := b.watchers[ev.Channel]
+	if !watched {
 		return
 	}
 	if ev.ThreadTimeStamp != "" {
 		return
 	}
-	if !strings.Contains(ev.Text, b.config.ThreadIdentifier) {
+	// Each channel matches its own wording — the identifier is per-channel.
+	if !strings.Contains(ev.Text, w.cfg.ThreadIdentifier) {
 		return
 	}
 
-	b.logger.Info("detected new standup thread", "ts", ev.TimeStamp, "user", ev.User)
+	b.logger.Info("detected new standup thread", "channel", w.cfg.Label(), "ts", ev.TimeStamp, "user", ev.User)
 
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				b.logger.Error("panic in ProcessNewStandup", "recover", r)
+				b.logger.Error("panic in ProcessNewStandup", "channel", w.cfg.Label(), "recover", r)
 			}
 		}()
-		b.standup.ProcessNewStandup(ev.TimeStamp)
+		w.service.ProcessNewStandup(ev.TimeStamp)
 	}()
 }
 

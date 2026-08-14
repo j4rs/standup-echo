@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/j4rs/standup-echo/internal/config"
@@ -15,13 +16,15 @@ import (
 )
 
 var (
-	triggerUser string
-	triggerDate string
+	triggerUser    string
+	triggerDate    string
+	triggerChannel string
 )
 
 func init() {
 	triggerCmd.Flags().StringVar(&triggerUser, "user", "", "only DM this Slack user ID")
 	triggerCmd.Flags().StringVar(&triggerDate, "date", "", "find thread for this date (YYYY-MM-DD)")
+	triggerCmd.Flags().StringVar(&triggerChannel, "channel", "", "channel ID or name to trigger (required when multiple are configured)")
 	rootCmd.AddCommand(triggerCmd)
 }
 
@@ -36,6 +39,11 @@ var triggerCmd = &cobra.Command{
 			return err
 		}
 		if err := cfg.Validate(); err != nil {
+			return err
+		}
+
+		channel, err := resolveChannel(cfg, triggerChannel)
+		if err != nil {
 			return err
 		}
 
@@ -55,9 +63,36 @@ var triggerCmd = &cobra.Command{
 		defer subscribers.Close()
 
 		api := slack.New(cfg.SlackBotToken)
-		svc := standup.NewService(api, cfg.ChannelID, cfg.ThreadIdentifier, subscribers, logger)
+		svc := standup.NewService(
+			api, channel.ChannelID, channel.ThreadIdentifier, subscribers,
+			logger.With("channel", channel.Label()),
+		)
 
 		svc.ProcessLatestStandup(triggerUser, date)
 		return nil
 	},
+}
+
+// resolveChannel picks which configured channel to act on. It defaults to the
+// only channel when just one is configured, and otherwise requires --channel.
+func resolveChannel(cfg *config.Config, want string) (*config.ChannelConfig, error) {
+	if want != "" {
+		ch := cfg.FindChannel(want)
+		if ch == nil {
+			return nil, fmt.Errorf("channel %q not found in config; configured: %s", want, channelList(cfg))
+		}
+		return ch, nil
+	}
+	if len(cfg.Channels) == 1 {
+		return &cfg.Channels[0], nil
+	}
+	return nil, fmt.Errorf("--channel is required when multiple channels are configured; configured: %s", channelList(cfg))
+}
+
+func channelList(cfg *config.Config) string {
+	labels := make([]string, 0, len(cfg.Channels))
+	for _, ch := range cfg.Channels {
+		labels = append(labels, ch.Label())
+	}
+	return strings.Join(labels, ", ")
 }

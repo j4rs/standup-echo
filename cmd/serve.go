@@ -43,7 +43,7 @@ var serveCmd = &cobra.Command{
 		}
 		defer subscribers.Close()
 
-		logger.Info("starting standup-echo", "config", cfgPath, "channel", cfg.ChannelID)
+		logger.Info("starting standup-echo", "config", cfgPath, "channels", len(cfg.Channels))
 
 		b, err := bot.New(cfg, subscribers, logger)
 		if err != nil {

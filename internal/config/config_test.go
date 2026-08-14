@@ -3,8 +3,14 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
+
+func testChannels() []ChannelConfig {
+	return []ChannelConfig{{Name: "m1", ChannelID: "C123", ThreadIdentifier: "Daily Check"}}
+}
 
 func TestDefaultPath(t *testing.T) {
 	path, err := DefaultPath()
@@ -23,10 +29,9 @@ func TestSaveAndLoad(t *testing.T) {
 	path := filepath.Join(dir, "config.yml")
 
 	original := &Config{
-		SlackBotToken:    "xoxb-test",
-		SlackAppToken:    "xapp-test",
-		ChannelID:        "C123",
-		ThreadIdentifier: "Daily Check",
+		SlackBotToken: "xoxb-test",
+		SlackAppToken: "xapp-test",
+		Channels:      testChannels(),
 	}
 
 	if err := Save(path, original); err != nil {
@@ -47,7 +52,7 @@ func TestSaveAndLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if *loaded != *original {
+	if !reflect.DeepEqual(loaded, original) {
 		t.Errorf("Load() = %+v, want %+v", loaded, original)
 	}
 }
@@ -57,10 +62,9 @@ func TestSaveCreatesDirectory(t *testing.T) {
 	path := filepath.Join(dir, "nested", "deep", "config.yml")
 
 	cfg := &Config{
-		SlackBotToken:    "xoxb-test",
-		SlackAppToken:    "xapp-test",
-		ChannelID:        "C123",
-		ThreadIdentifier: "Daily Check",
+		SlackBotToken: "xoxb-test",
+		SlackAppToken: "xapp-test",
+		Channels:      testChannels(),
 	}
 
 	if err := Save(path, cfg); err != nil {
@@ -69,6 +73,116 @@ func TestSaveCreatesDirectory(t *testing.T) {
 
 	if _, err := os.Stat(path); err != nil {
 		t.Errorf("config file not created: %v", err)
+	}
+}
+
+// Configs written before multi-channel support use top-level channel_id and
+// thread_identifier. Loading one must keep working without a manual edit.
+func TestLoadMigratesLegacySingleChannel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+
+	legacy := []byte("slack_bot_token: xoxb-test\n" +
+		"slack_app_token: xapp-test\n" +
+		"channel_id: C111\n" +
+		"thread_identifier: Daily Standup\n")
+	if err := os.WriteFile(path, legacy, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("migrated config should be valid: %v", err)
+	}
+
+	want := []ChannelConfig{{ChannelID: "C111", ThreadIdentifier: "Daily Standup"}}
+	if !reflect.DeepEqual(cfg.Channels, want) {
+		t.Errorf("Channels = %+v, want %+v", cfg.Channels, want)
+	}
+	if cfg.ChannelID != "" || cfg.ThreadIdentifier != "" {
+		t.Errorf("legacy fields should be cleared, got %q / %q", cfg.ChannelID, cfg.ThreadIdentifier)
+	}
+
+	// Re-saving must not resurrect the legacy keys.
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(data); strings.Contains(got, "channel_id: C111\n") && !strings.Contains(got, "channels:") {
+		t.Errorf("saved config kept the legacy shape:\n%s", got)
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(reloaded.Channels, want) {
+		t.Errorf("round-tripped Channels = %+v, want %+v", reloaded.Channels, want)
+	}
+}
+
+// A legacy config that has already been migrated by hand must not end up with
+// the same channel twice.
+func TestLoadLegacyDoesNotDuplicateExistingChannel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+
+	mixed := []byte("slack_bot_token: xoxb-test\n" +
+		"slack_app_token: xapp-test\n" +
+		"channel_id: C111\n" +
+		"thread_identifier: Daily Standup\n" +
+		"channels:\n" +
+		"  - channel_id: C111\n" +
+		"    thread_identifier: Daily Standup\n" +
+		"  - channel_id: C222\n" +
+		"    thread_identifier: async standup check-in\n")
+	if err := os.WriteFile(path, mixed, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Channels) != 2 {
+		t.Fatalf("got %d channels, want 2: %+v", len(cfg.Channels), cfg.Channels)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil", err)
+	}
+}
+
+func TestFindChannel(t *testing.T) {
+	cfg := &Config{Channels: []ChannelConfig{
+		{Name: "m1", ChannelID: "C111", ThreadIdentifier: "Daily Standup"},
+		{Name: "m2", ChannelID: "C222", ThreadIdentifier: "async standup check-in"},
+	}}
+
+	tests := []struct {
+		query string
+		want  string
+	}{
+		{"m2", "C222"},
+		{"C111", "C111"},
+		{"", ""},
+		{"nope", ""},
+	}
+	for _, tt := range tests {
+		got := cfg.FindChannel(tt.query)
+		if tt.want == "" {
+			if got != nil {
+				t.Errorf("FindChannel(%q) = %+v, want nil", tt.query, got)
+			}
+			continue
+		}
+		if got == nil || got.ChannelID != tt.want {
+			t.Errorf("FindChannel(%q) = %+v, want channel %s", tt.query, got, tt.want)
+		}
 	}
 }
 
@@ -81,10 +195,12 @@ func TestLoadNonexistent(t *testing.T) {
 
 func TestValidate(t *testing.T) {
 	valid := &Config{
-		SlackBotToken:    "xoxb-test",
-		SlackAppToken:    "xapp-test",
-		ChannelID:        "C123",
-		ThreadIdentifier: "Daily Check",
+		SlackBotToken: "xoxb-test",
+		SlackAppToken: "xapp-test",
+		Channels: []ChannelConfig{
+			{Name: "m1", ChannelID: "C111", ThreadIdentifier: "Daily Standup"},
+			{Name: "m2", ChannelID: "C222", ThreadIdentifier: "async standup check-in"},
+		},
 	}
 	if err := valid.Validate(); err != nil {
 		t.Errorf("Validate() returned error for valid config: %v", err)
@@ -95,10 +211,35 @@ func TestValidate(t *testing.T) {
 		cfg   Config
 		field string
 	}{
-		{"missing bot token", Config{SlackAppToken: "x", ChannelID: "x", ThreadIdentifier: "x"}, "slack_bot_token"},
-		{"missing app token", Config{SlackBotToken: "x", ChannelID: "x", ThreadIdentifier: "x"}, "slack_app_token"},
-		{"missing channel", Config{SlackBotToken: "x", SlackAppToken: "x", ThreadIdentifier: "x"}, "channel_id"},
-		{"missing identifier", Config{SlackBotToken: "x", SlackAppToken: "x", ChannelID: "x"}, "thread_identifier"},
+		{"missing bot token", Config{SlackAppToken: "x", Channels: testChannels()}, "slack_bot_token"},
+		{"missing app token", Config{SlackBotToken: "x", Channels: testChannels()}, "slack_app_token"},
+		{"no channels", Config{SlackBotToken: "x", SlackAppToken: "x"}, "channels"},
+		{
+			"missing channel id",
+			Config{SlackBotToken: "x", SlackAppToken: "x", Channels: []ChannelConfig{{ThreadIdentifier: "x"}}},
+			"channel_id",
+		},
+		{
+			"missing identifier",
+			Config{SlackBotToken: "x", SlackAppToken: "x", Channels: []ChannelConfig{{ChannelID: "x"}}},
+			"thread_identifier",
+		},
+		{
+			"duplicate channel id",
+			Config{SlackBotToken: "x", SlackAppToken: "x", Channels: []ChannelConfig{
+				{ChannelID: "C111", ThreadIdentifier: "a"},
+				{ChannelID: "C111", ThreadIdentifier: "b"},
+			}},
+			"duplicate channel_id",
+		},
+		{
+			"duplicate name",
+			Config{SlackBotToken: "x", SlackAppToken: "x", Channels: []ChannelConfig{
+				{Name: "team", ChannelID: "C111", ThreadIdentifier: "a"},
+				{Name: "team", ChannelID: "C222", ThreadIdentifier: "b"},
+			}},
+			"duplicate name",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

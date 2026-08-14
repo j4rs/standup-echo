@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,16 +32,21 @@ func NewService(client *slack.Client, channelID, threadIdentifier string, subscr
 	}
 }
 
+// historyLookback bounds how far back a history scan will page. Without a
+// bound, a misconfigured thread identifier walks a channel's entire history and
+// burns through the conversations.history rate limit before failing.
+const historyLookback = 21 * 24 * time.Hour
+
 // FindPreviousStandupThread scans channel history for the most recent parent
 // message matching the thread identifier, excluding the message at currentTS.
 func (s *Service) FindPreviousStandupThread(currentTS string) (string, error) {
-	cursor := ""
+	params := &slack.GetConversationHistoryParameters{
+		ChannelID: s.channelID,
+		Limit:     100,
+		Oldest:    timeToTS(time.Now().Add(-historyLookback)),
+	}
+
 	for {
-		params := &slack.GetConversationHistoryParameters{
-			ChannelID: s.channelID,
-			Limit:     100,
-			Cursor:    cursor,
-		}
 		history, err := s.client.GetConversationHistory(params)
 		if err != nil {
 			return "", fmt.Errorf("fetching channel history: %w", err)
@@ -59,10 +65,10 @@ func (s *Service) FindPreviousStandupThread(currentTS string) (string, error) {
 		if !history.HasMore {
 			break
 		}
-		cursor = history.ResponseMetaData.NextCursor
+		params.Cursor = history.ResponseMetaData.NextCursor
 	}
 
-	return "", fmt.Errorf("no previous standup thread found")
+	return "", fmt.Errorf("no previous standup thread found in the last %d days", int(historyLookback.Hours()/24))
 }
 
 // GetThreadReplies fetches all replies for a thread, deduplicates by user
@@ -180,13 +186,21 @@ func isBoldDateLine(line string) bool {
 // date. Otherwise it returns the most recent one.
 func (s *Service) FindStandupThread(date time.Time) (string, error) {
 	filterByDate := !date.IsZero()
-	cursor := ""
+
+	params := &slack.GetConversationHistoryParameters{
+		ChannelID: s.channelID,
+		Limit:     100,
+	}
+	if filterByDate {
+		// Bound the scan to the requested day so we don't page the whole channel.
+		start := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, date.Location())
+		params.Oldest = timeToTS(start)
+		params.Latest = timeToTS(start.AddDate(0, 0, 1))
+	} else {
+		params.Oldest = timeToTS(time.Now().Add(-historyLookback))
+	}
+
 	for {
-		params := &slack.GetConversationHistoryParameters{
-			ChannelID: s.channelID,
-			Limit:     100,
-			Cursor:    cursor,
-		}
 		history, err := s.client.GetConversationHistory(params)
 		if err != nil {
 			return "", fmt.Errorf("fetching channel history: %w", err)
@@ -211,10 +225,13 @@ func (s *Service) FindStandupThread(date time.Time) (string, error) {
 		if !history.HasMore {
 			break
 		}
-		cursor = history.ResponseMetaData.NextCursor
+		params.Cursor = history.ResponseMetaData.NextCursor
 	}
 
-	return "", fmt.Errorf("no standup thread found")
+	if filterByDate {
+		return "", fmt.Errorf("no standup thread found on %s", date.Format("2006-01-02"))
+	}
+	return "", fmt.Errorf("no standup thread found in the last %d days", int(historyLookback.Hours()/24))
 }
 
 // ProcessLatestStandup finds a standup thread, gets replies, and sends DMs.
@@ -279,14 +296,18 @@ func (s *Service) ProcessNewStandup(newThreadTS string) {
 }
 
 // tsToTime converts a Slack timestamp (e.g. "1708300000.000000") to time.Time.
+// A malformed timestamp yields the Unix epoch rather than a garbage time.
 func tsToTime(ts string) time.Time {
-	parts := strings.SplitN(ts, ".", 2)
-	if len(parts) == 0 {
-		return time.Time{}
-	}
-	var sec int64
-	for _, c := range parts[0] {
-		sec = sec*10 + int64(c-'0')
+	secPart, _, _ := strings.Cut(ts, ".")
+	sec, err := strconv.ParseInt(secPart, 10, 64)
+	if err != nil {
+		return time.Unix(0, 0)
 	}
 	return time.Unix(sec, 0)
+}
+
+// timeToTS converts a time.Time to a Slack timestamp string, for use as an
+// oldest/latest bound on history queries.
+func timeToTS(t time.Time) string {
+	return fmt.Sprintf("%d.000000", t.Unix())
 }
