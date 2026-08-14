@@ -118,19 +118,8 @@ func (b *Bot) handleMessageEvent(evt *socketmode.Event, client *socketmode.Clien
 	}
 
 	// Channel messages: detect new standup threads.
-	// Allow regular messages and bot_message (workflow posts).
-	if ev.SubType != "" && ev.SubType != "bot_message" {
-		return
-	}
-	w, watched := b.watchers[ev.Channel]
-	if !watched {
-		return
-	}
-	if ev.ThreadTimeStamp != "" {
-		return
-	}
-	// Each channel matches its own wording — the identifier is per-channel.
-	if !strings.Contains(ev.Text, w.cfg.ThreadIdentifier) {
+	w := b.routeStandup(ev.Channel, ev.SubType, ev.ThreadTimeStamp, ev.Text)
+	if w == nil {
 		return
 	}
 
@@ -144,6 +133,31 @@ func (b *Bot) handleMessageEvent(evt *socketmode.Event, client *socketmode.Clien
 		}()
 		w.service.ProcessNewStandup(ev.TimeStamp)
 	}()
+}
+
+// routeStandup decides which watcher, if any, should process a channel message.
+// It returns nil when the message is not a new standup post in a watched
+// channel. Kept free of Slack client calls so the routing rules are testable.
+func (b *Bot) routeStandup(channelID, subType, threadTS, text string) *watcher {
+	// Allow regular messages and bot_message, which is how a Slack Workflow
+	// posts a scheduled standup.
+	if subType != "" && subType != "bot_message" {
+		return nil
+	}
+	w, watched := b.watchers[channelID]
+	if !watched {
+		return nil
+	}
+	// Thread replies are not new standup posts.
+	if threadTS != "" {
+		return nil
+	}
+	// Each channel matches its own wording, against the message body — a
+	// workflow's display name never appears in the text.
+	if !strings.Contains(text, w.cfg.ThreadIdentifier) {
+		return nil
+	}
+	return w
 }
 
 func (b *Bot) handleDMCommand(ev *slackevents.MessageEvent) {
