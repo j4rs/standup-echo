@@ -63,6 +63,45 @@ func TestHistoryLookbackIsBounded(t *testing.T) {
 	}
 }
 
+// The previous-thread search must never look forward. With --date targeting an
+// older thread, an unbounded upper end would return a *newer* thread as the
+// "previous" one.
+func TestPreviousThreadWindowNeverLooksForward(t *testing.T) {
+	now := time.Unix(1786800000, 0)
+	currentTS := "1786713302.936859" // yesterday's thread, not the newest
+
+	oldest, latest := previousThreadWindow(currentTS, now)
+
+	if latest != currentTS {
+		t.Errorf("latest = %q, want the target thread %q", latest, currentTS)
+	}
+	if tsToTime(oldest).After(tsToTime(latest)) {
+		t.Errorf("oldest %v should not follow latest %v", oldest, latest)
+	}
+	// The window must end at the target, not at now, or a newer thread qualifies.
+	if !tsToTime(latest).Before(now) {
+		t.Errorf("latest %v should precede now %v", tsToTime(latest), now)
+	}
+	if got := tsToTime(latest).Sub(tsToTime(oldest)); got != historyLookback {
+		t.Errorf("window spans %v, want %v", got, historyLookback)
+	}
+}
+
+func TestPreviousThreadWindowFallsBackOnBadTimestamp(t *testing.T) {
+	now := time.Unix(1786800000, 0)
+
+	for _, ts := range []string{"", "not-a-ts"} {
+		oldest, latest := previousThreadWindow(ts, now)
+		if latest != ts {
+			t.Errorf("previousThreadWindow(%q) latest = %q, want %q", ts, latest, ts)
+		}
+		// With no usable reference the window ends at now instead of the epoch.
+		if want := timeToTS(now.Add(-historyLookback)); oldest != want {
+			t.Errorf("previousThreadWindow(%q) oldest = %q, want %q", ts, oldest, want)
+		}
+	}
+}
+
 // A date-filtered scan bounds to a single local day, so the requested date sits
 // inside the window and the neighbouring days do not.
 func TestDateBoundsCoverExactlyOneDay(t *testing.T) {

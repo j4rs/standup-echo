@@ -133,12 +133,26 @@ gets one DM per channel.
 Useful for verifying a new channel's identifier or re-sending a missed day:
 
 ```bash
-standup-echo trigger --channel m2                   # most recent m2 standup thread
+standup-echo trigger --channel m2                   # target the newest m2 thread
 standup-echo trigger --channel m2 --date 2026-08-13
-standup-echo trigger --channel m2 --user U0123456   # limit to one person
+standup-echo trigger --channel m2 --user U0123456   # limit delivery to one person
 ```
 
 `--channel` takes a channel ID or the configured `name`, and is required when more
-than one channel is configured. Note that `trigger` echoes replies from the thread
-it finds back to their authors, whereas `serve` echoes the *previous* thread into
-the newly posted one.
+than one channel is configured.
+
+`trigger` runs the same path as `serve`: it locates the target thread, then echoes
+the **preceding** thread's replies into it. A trigger run is therefore a faithful
+rehearsal of the live flow, not an approximation of it.
+
+To check a channel's configuration without DMing anyone, pass a `--user` that has no
+reply in the thread — the run stops before delivery, having already proven channel
+access, identifier matching, and reply collection:
+
+```bash
+standup-echo trigger --channel m2 --user UDRYRUN00000
+```
+
+Every run logs a summary line — `finished sending DMs sent=N skipped_not_subscribed=N
+failed=N` — so a run that delivers nothing explains itself rather than looking broken.
+The most common cause of `sent=0` is a recipient who hasn't sent `subscribe`.

@@ -37,13 +37,31 @@ func NewService(client *slack.Client, channelID, threadIdentifier string, subscr
 // burns through the conversations.history rate limit before failing.
 const historyLookback = 21 * 24 * time.Hour
 
+// previousThreadWindow bounds a search for the standup thread preceding
+// currentTS: strictly older than currentTS, and no further back than
+// historyLookback. Bounding the upper end matters when currentTS is not the
+// newest thread in the channel — otherwise the scan would return a *newer*
+// thread as the "previous" one.
+func previousThreadWindow(currentTS string, now time.Time) (oldest, latest string) {
+	ref := tsToTime(currentTS)
+	if ref.Unix() <= 0 {
+		// Unparseable timestamp: fall back to a window ending now.
+		ref = now
+	}
+	return timeToTS(ref.Add(-historyLookback)), currentTS
+}
+
 // FindPreviousStandupThread scans channel history for the most recent parent
-// message matching the thread identifier, excluding the message at currentTS.
+// message matching the thread identifier that is older than currentTS.
 func (s *Service) FindPreviousStandupThread(currentTS string) (string, error) {
+	oldest, latest := previousThreadWindow(currentTS, time.Now())
 	params := &slack.GetConversationHistoryParameters{
 		ChannelID: s.channelID,
 		Limit:     100,
-		Oldest:    timeToTS(time.Now().Add(-historyLookback)),
+		Oldest:    oldest,
+		// Slack treats latest as exclusive unless Inclusive is set, so this
+		// drops currentTS itself as well as anything newer.
+		Latest: latest,
 	}
 
 	for {
@@ -97,25 +115,33 @@ func (s *Service) GetThreadReplies(threadTS string) (map[string]string, error) {
 	return replies, nil
 }
 
-// SendDMs sends each user their previous standup reply via direct message.
-func (s *Service) SendDMs(replies map[string]string, newThreadTS string) error {
+// SendDMs sends each user their previous standup reply via direct message,
+// skipping anyone who has not opted in. The per-run summary is logged at info
+// so a run that delivers nothing says why rather than looking like a failure.
+func (s *Service) SendDMs(replies map[string]string, newThreadTS string) {
 	today := time.Now().Format("Monday, January 2")
 	newThreadLink := s.getThreadPermalink(newThreadTS)
 
+	var sent, skipped, failed int
 	for userID, reply := range replies {
 		if !s.subscribers.IsSubscribed(userID) {
 			s.logger.Debug("skipping non-subscribed user", "user", userID)
+			skipped++
 			continue
 		}
 		text := buildDMText(today, reply, newThreadLink)
 		_, _, err := s.client.PostMessage(userID, slack.MsgOptionText(text, false))
 		if err != nil {
 			s.logger.Error("failed to DM user", "user", userID, "error", err)
+			failed++
 			continue
 		}
 		s.logger.Info("sent DM", "user", userID)
+		sent++
 	}
-	return nil
+
+	s.logger.Info("finished sending DMs",
+		"sent", sent, "skipped_not_subscribed", skipped, "failed", failed)
 }
 
 func (s *Service) getThreadPermalink(threadTS string) string {
@@ -234,9 +260,11 @@ func (s *Service) FindStandupThread(date time.Time) (string, error) {
 	return "", fmt.Errorf("no standup thread found in the last %d days", int(historyLookback.Hours()/24))
 }
 
-// ProcessLatestStandup finds a standup thread, gets replies, and sends DMs.
-// If onlyUser is non-empty, only that user will receive a DM.
-// If date is non-zero, it finds the thread for that specific date.
+// ProcessLatestStandup rehearses the live flow against an existing thread: it
+// locates a standup thread, then echoes the *preceding* thread's replies into
+// it, exactly as ProcessNewStandup does when a thread is posted for real.
+// If onlyUser is non-empty, only that user receives a DM.
+// If date is non-zero, it targets the thread posted on that date.
 func (s *Service) ProcessLatestStandup(onlyUser string, date time.Time) {
 	s.logger.Info("processing standup thread", "only_user", onlyUser, "date", date)
 
@@ -246,34 +274,20 @@ func (s *Service) ProcessLatestStandup(onlyUser string, date time.Time) {
 		return
 	}
 
-	replies, err := s.GetThreadReplies(threadTS)
-	if err != nil {
-		s.logger.Error("failed to get thread replies", "error", err)
-		return
-	}
-
-	if onlyUser != "" {
-		if reply, ok := replies[onlyUser]; ok {
-			replies = map[string]string{onlyUser: reply}
-		} else {
-			s.logger.Info("user has no reply in latest thread", "user", onlyUser)
-			return
-		}
-	}
-	if len(replies) == 0 {
-		s.logger.Info("no replies in standup thread")
-		return
-	}
-
-	if err := s.SendDMs(replies, threadTS); err != nil {
-		s.logger.Error("failed to send DMs", "error", err)
-	}
+	s.echoPreviousInto(threadTS, onlyUser)
 }
 
 // ProcessNewStandup is the orchestrator: find previous thread, get replies, send DMs.
 func (s *Service) ProcessNewStandup(newThreadTS string) {
 	s.logger.Info("processing new standup thread", "ts", newThreadTS)
+	s.echoPreviousInto(newThreadTS, "")
+}
 
+// echoPreviousInto DMs each subscriber their reply from the thread preceding
+// newThreadTS, linking newThreadTS. When onlyUser is non-empty, delivery is
+// limited to that user. Both the live path and the manual trigger go through
+// here so a trigger run is a faithful rehearsal rather than an approximation.
+func (s *Service) echoPreviousInto(newThreadTS, onlyUser string) {
 	prevTS, err := s.FindPreviousStandupThread(newThreadTS)
 	if err != nil {
 		s.logger.Warn("no previous standup thread found", "error", err)
@@ -285,14 +299,21 @@ func (s *Service) ProcessNewStandup(newThreadTS string) {
 		s.logger.Error("failed to get thread replies", "error", err)
 		return
 	}
+
+	if onlyUser != "" {
+		reply, ok := replies[onlyUser]
+		if !ok {
+			s.logger.Info("user has no reply in the previous thread", "user", onlyUser, "thread_ts", prevTS)
+			return
+		}
+		replies = map[string]string{onlyUser: reply}
+	}
 	if len(replies) == 0 {
 		s.logger.Info("no replies in previous standup thread")
 		return
 	}
 
-	if err := s.SendDMs(replies, newThreadTS); err != nil {
-		s.logger.Error("failed to send DMs", "error", err)
-	}
+	s.SendDMs(replies, newThreadTS)
 }
 
 // tsToTime converts a Slack timestamp (e.g. "1708300000.000000") to time.Time.

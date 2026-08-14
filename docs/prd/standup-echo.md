@@ -125,7 +125,7 @@ team, it's time for our daily async standup check-in!"* will not match
 | Command | Description |
 |---------|-------------|
 | `standup-echo serve` | Start the bot daemon (watches every configured channel) |
-| `standup-echo trigger` | Manually process a thread; `--channel`, `--date`, `--user` |
+| `standup-echo trigger` | Rehearse the live flow against an existing thread; `--channel`, `--date`, `--user` |
 | `standup-echo configure` | Interactive configuration setup |
 | `standup-echo version` | Print version information |
 
