@@ -16,15 +16,17 @@ import (
 )
 
 var (
-	triggerUser    string
-	triggerDate    string
-	triggerChannel string
+	triggerUser     string
+	triggerDate     string
+	triggerChannel  string
+	triggerReminder bool
 )
 
 func init() {
 	triggerCmd.Flags().StringVar(&triggerUser, "user", "", "only DM this Slack user ID")
 	triggerCmd.Flags().StringVar(&triggerDate, "date", "", "find thread for this date (YYYY-MM-DD)")
 	triggerCmd.Flags().StringVar(&triggerChannel, "channel", "", "channel ID or name to trigger (required when multiple are configured)")
+	triggerCmd.Flags().BoolVar(&triggerReminder, "reminder", false, "send the mid-day \"you haven't posted yet\" reminder instead of the echo")
 	rootCmd.AddCommand(triggerCmd)
 }
 
@@ -64,9 +66,21 @@ var triggerCmd = &cobra.Command{
 
 		api := slack.New(cfg.SlackBotToken)
 		svc := standup.NewService(
-			api, channel.ChannelID, channel.ThreadIdentifier, subscribers,
+			api, channel.ChannelID, channel.ThreadIdentifier, cfg.MissedStandupGrace(), subscribers,
 			logger.With("channel", channel.Label()),
 		)
+
+		// --reminder rehearses the scheduled nudge without waiting for the
+		// timer, and without consulting the sent-reminder table, so it can be
+		// run repeatedly. Pair it with --user to keep a test to yourself.
+		if triggerReminder {
+			threadTS, err := svc.FindStandupThread(date)
+			if err != nil {
+				return err
+			}
+			svc.RemindUnposted(threadTS, triggerUser)
+			return nil
+		}
 
 		svc.ProcessLatestStandup(triggerUser, date)
 		return nil

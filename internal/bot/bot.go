@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/j4rs/standup-echo/internal/config"
 	"github.com/j4rs/standup-echo/internal/standup"
@@ -30,6 +31,11 @@ type Bot struct {
 	config      *config.Config
 	logger      *slog.Logger
 	botUserID   string
+
+	// reminders is nil when mid-day reminders are disabled, which is the single
+	// check that gates the whole feature.
+	reminders     *store.Reminders
+	reminderAfter time.Duration
 }
 
 // New creates a Bot from the given config, subscriber store, and logger.
@@ -46,19 +52,30 @@ func New(cfg *config.Config, subscribers *store.Subscribers, logger *slog.Logger
 		watchers[ch.ChannelID] = &watcher{
 			cfg: ch,
 			service: standup.NewService(
-				api, ch.ChannelID, ch.ThreadIdentifier, subscribers,
+				api, ch.ChannelID, ch.ThreadIdentifier, cfg.MissedStandupGrace(), subscribers,
 				logger.With("channel", ch.Label()),
 			),
 		}
 	}
 
+	reminderAfter, remindersEnabled := cfg.ReminderDelay()
+	var reminders *store.Reminders
+	if remindersEnabled {
+		var err error
+		if reminders, err = store.NewReminders(subscribers); err != nil {
+			return nil, err
+		}
+	}
+
 	b := &Bot{
-		client:      api,
-		handler:     handler,
-		watchers:    watchers,
-		subscribers: subscribers,
-		config:      cfg,
-		logger:      logger,
+		client:        api,
+		handler:       handler,
+		watchers:      watchers,
+		subscribers:   subscribers,
+		config:        cfg,
+		logger:        logger,
+		reminders:     reminders,
+		reminderAfter: reminderAfter,
 	}
 
 	handler.HandleEvents(slackevents.Message, b.handleMessageEvent)
@@ -80,6 +97,13 @@ func (b *Bot) Run() error {
 			"channel", w.cfg.Label(),
 			"channel_id", w.cfg.ChannelID,
 			"thread_identifier", w.cfg.ThreadIdentifier)
+	}
+
+	if b.reminders == nil {
+		b.logger.Info("mid-day reminders disabled")
+	} else {
+		b.logger.Info("mid-day reminders enabled", "after_thread", b.reminderAfter)
+		b.armTodaysReminders()
 	}
 
 	b.logger.Info("starting socket mode connection")
@@ -133,6 +157,65 @@ func (b *Bot) handleMessageEvent(evt *socketmode.Event, client *socketmode.Clien
 		}()
 		w.service.ProcessNewStandup(ev.TimeStamp)
 	}()
+
+	b.scheduleReminder(w, ev.TimeStamp)
+}
+
+// armTodaysReminders recovers scheduling across a restart. A thread posted while
+// the process was down still gets its reminder, provided the window has not
+// already passed.
+func (b *Bot) armTodaysReminders() {
+	for _, w := range b.watchers {
+		ts, err := w.service.FindStandupThread(time.Now())
+		if err != nil {
+			b.logger.Info("no standup thread today to remind about", "channel", w.cfg.Label())
+			continue
+		}
+		b.scheduleReminder(w, ts)
+	}
+}
+
+// scheduleReminder arms the mid-day nudge for a standup thread. Firing is
+// relative to the thread's own timestamp rather than a wall clock, so it needs
+// no timezone and follows the standup if its scheduled time moves.
+func (b *Bot) scheduleReminder(w *watcher, threadTS string) {
+	if b.reminders == nil {
+		return
+	}
+
+	delay := time.Until(standup.ThreadTime(threadTS).Add(b.reminderAfter))
+	if delay <= 0 {
+		// Most likely a restart catching up on an old thread. A nag hours late
+		// is worse than none, so drop it rather than firing immediately.
+		b.logger.Info("skipping reminder, window already passed",
+			"channel", w.cfg.Label(), "ts", threadTS)
+		return
+	}
+
+	b.logger.Info("scheduled reminder",
+		"channel", w.cfg.Label(), "ts", threadTS, "in", delay.Round(time.Minute))
+
+	time.AfterFunc(delay, func() {
+		defer func() {
+			if r := recover(); r != nil {
+				b.logger.Error("panic in RemindUnposted", "channel", w.cfg.Label(), "recover", r)
+			}
+		}()
+
+		// Claiming before sending is what makes a redeploy mid-afternoon safe:
+		// the second scheduler to reach this thread finds it already claimed.
+		claimed, err := b.reminders.Claim(w.cfg.ChannelID, threadTS)
+		if err != nil {
+			b.logger.Error("failed to claim reminder", "channel", w.cfg.Label(), "error", err)
+			return
+		}
+		if !claimed {
+			b.logger.Info("reminder already sent for this thread",
+				"channel", w.cfg.Label(), "ts", threadTS)
+			return
+		}
+		w.service.RemindUnposted(threadTS, "")
+	})
 }
 
 // routeStandup decides which watcher, if any, should process a channel message.

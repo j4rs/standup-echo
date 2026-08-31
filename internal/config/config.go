@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -26,15 +27,62 @@ func (c ChannelConfig) Label() string {
 	return c.ChannelID
 }
 
+// defaultMaxMissedStandups is the grace allowance applied when a config does
+// not set one. Two keeps a forgotten day (and a two-day trip) recoverable while
+// costing an absent subscriber only two nudges before the bot goes quiet.
+const defaultMaxMissedStandups = 2
+
+// defaultReminderAfter is how long after a standup thread is posted the
+// "you haven't posted yet" reminder fires when the config does not say.
+// Anchoring to the thread rather than a wall clock avoids a timezone field and
+// follows the standup if its scheduled time ever moves.
+const defaultReminderAfter = 4 * time.Hour
+
 type Config struct {
 	SlackBotToken string          `yaml:"slack_bot_token"`
 	SlackAppToken string          `yaml:"slack_app_token"`
 	Channels      []ChannelConfig `yaml:"channels"`
 
+	// MaxMissedStandups is how many consecutive standups a subscriber may miss
+	// and still receive a nudge. It is a pointer so that an explicit 0 (never
+	// nudge someone who skipped the last standup) is distinguishable from the
+	// key being absent, which takes defaultMaxMissedStandups. Global rather
+	// than per-channel, matching the global subscriber opt-in.
+	MaxMissedStandups *int `yaml:"max_missed_standups,omitempty"`
+
+	// ReminderAfter is how long after a standup thread is posted to DM anyone
+	// on the roster who has not replied to it yet, as a Go duration ("4h",
+	// "90m"). Empty takes defaultReminderAfter; "0" disables reminders.
+	ReminderAfter string `yaml:"reminder_after,omitempty"`
+
 	// Deprecated: pre-multi-channel fields. Load folds these into Channels and
 	// clears them, so configs written before multi-channel support keep working.
 	ChannelID        string `yaml:"channel_id,omitempty"`
 	ThreadIdentifier string `yaml:"thread_identifier,omitempty"`
+}
+
+// MissedStandupGrace returns how many consecutive standups a subscriber may
+// miss and still be nudged, falling back to the default when unset.
+func (c *Config) MissedStandupGrace() int {
+	if c.MaxMissedStandups == nil {
+		return defaultMaxMissedStandups
+	}
+	return *c.MaxMissedStandups
+}
+
+// ReminderDelay returns how long after a standup thread is posted the reminder
+// should fire, and whether reminders are enabled at all. Validate has already
+// rejected an unparseable value, so a parse failure here disables reminders
+// rather than guessing a delay.
+func (c *Config) ReminderDelay() (time.Duration, bool) {
+	if c.ReminderAfter == "" {
+		return defaultReminderAfter, true
+	}
+	d, err := time.ParseDuration(c.ReminderAfter)
+	if err != nil || d <= 0 {
+		return 0, false
+	}
+	return d, true
 }
 
 // DefaultPath returns ~/.config/standup-echo/config.yml.
@@ -115,6 +163,15 @@ func (c *Config) Validate() error {
 	}
 	if len(c.Channels) == 0 {
 		return fmt.Errorf("at least one entry under channels is required")
+	}
+	if c.MaxMissedStandups != nil && *c.MaxMissedStandups < 0 {
+		return fmt.Errorf("max_missed_standups must not be negative, got %d", *c.MaxMissedStandups)
+	}
+	// A typo here would otherwise disable reminders silently.
+	if c.ReminderAfter != "" {
+		if _, err := time.ParseDuration(c.ReminderAfter); err != nil {
+			return fmt.Errorf("reminder_after %q is not a valid duration (e.g. \"4h\", \"90m\", or \"0\" to disable): %w", c.ReminderAfter, err)
+		}
 	}
 
 	seenID := make(map[string]bool, len(c.Channels))

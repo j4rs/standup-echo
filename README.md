@@ -65,6 +65,8 @@ Config is saved to `~/.config/standup-echo/config.yml`:
 ```yaml
 slack_bot_token: xoxb-...
 slack_app_token: xapp-...
+max_missed_standups: 2
+reminder_after: 4h
 channels:
   - name: m1
     channel_id: C0123456789
@@ -75,7 +77,9 @@ channels:
 ```
 
 Pre-multi-channel configs with top-level `channel_id` / `thread_identifier` still
-load — they're folded into `channels` automatically.
+load — they're folded into `channels` automatically. `max_missed_standups` and
+`reminder_after` are both optional; see [Missed standups](#missed-standups) and
+[Mid-day reminders](#mid-day-reminders).
 
 ### Picking a thread identifier
 
@@ -88,6 +92,61 @@ distinctive phrase from the body itself, e.g. `async standup check-in`.
 To check what the bot actually sees, run `standup-echo trigger --channel <name>`
 after inviting the bot; it logs `found standup thread` on a match and
 `no standup thread found` otherwise.
+
+### Missed standups
+
+The DM is what prompts you to write the next update, so delivering it only to
+people who replied in the *immediately* preceding thread makes one missed day
+self-perpetuating: skip Wednesday, get no nudge Thursday, skip Thursday too.
+
+`max_missed_standups` is how many standups in a row you can miss and still be
+nudged. The bot scans back that many threads plus one, and DMs anyone who replied
+in any of them, echoing their most recent update. At the default of `2`:
+
+| Last replied      | Nudged today? |
+|-------------------|---------------|
+| yesterday         | yes           |
+| two standups ago  | yes           |
+| three standups ago| yes           |
+| four or more ago  | no            |
+
+So a forgotten day recovers on its own, while a real absence costs two more DMs
+per channel and then goes quiet — and it resumes automatically the next time you
+reply in a thread. Set it to `0` to nudge only people who replied in the previous
+thread. Note the unit is *standup threads*, not calendar days, so a weekend does
+not consume the allowance.
+
+### Mid-day reminders
+
+The morning DM hands you a template; the mid-day one is the actual nag. If you are
+on the roster for a channel and haven't posted in today's thread by then, the bot
+DMs you a short nudge with a link to it.
+
+`reminder_after` is a Go duration measured **from the moment the standup thread is
+posted**, not a wall-clock time. With a standup that posts at 9:15am and the default
+`4h`, the reminder lands around 1:15pm. Anchoring to the thread means there is no
+timezone to configure, nothing to break at a DST boundary, and the reminder follows
+the standup automatically if its scheduled time ever moves. Set `reminder_after: 0`
+to turn reminders off.
+
+The roster is stricter than the morning nudge: it is only the people who posted in
+the **immediately preceding** thread, ignoring `max_missed_standups`. The morning
+grace window exists to recover a loop that went silent, whereas a reminder is a nag
+and should decay fast — someone away for a week drops off the roster after one
+standup instead of being pinged for days.
+
+Consequences worth knowing:
+
+- **No standup thread today, no reminder.** Weekends, holidays, and a workflow that
+  failed to post all need no special handling.
+- **One reminder per thread, ever.** Sends are recorded in a `reminders` table, so
+  restarting or redeploying mid-afternoon cannot nag anyone twice.
+- **A restart is recovered.** On startup the bot scans for today's thread and re-arms
+  the timer, unless the window has already passed — a nag hours late is worse than
+  none.
+- **Reminders are not separately opt-out-able.** `unsubscribe` turns off both the
+  echo and the reminder. Splitting them needs the `(user_id, channel_id)` primary key
+  that per-channel opt-out was already deferred for.
 
 ## Usage
 
@@ -103,7 +162,7 @@ standup-echo serve
 brew services start standup-echo
 ```
 
-The bot starts on login and watches for new standup threads. When one appears, it finds the previous thread, collects each user's reply, and DMs subscribed users their update as a ready-to-edit template.
+The bot starts on login and watches for new standup threads. When one appears, it scans the recent preceding threads, collects each user's most recent reply, and DMs subscribed users their update as a ready-to-edit template.
 
 ### Opting in
 
@@ -115,9 +174,9 @@ The bot is **opt-in only**. Each user must DM the bot to subscribe:
 Subscriber data is stored locally at `~/.config/standup-echo/standup-echo.db`.
 
 Subscribing is a single global opt-in — there's no need to name a channel. A DM is
-only ever sent to someone who replied in that channel's previous standup thread, so
-the reply itself establishes which team you're on. Anyone in two standup channels
-gets one DM per channel.
+only ever sent to someone who replied in one of that channel's recent standup
+threads, so the reply itself establishes which team you're on. Anyone in two
+standup channels gets one DM per channel.
 
 ## Commands
 
@@ -136,6 +195,7 @@ Useful for verifying a new channel's identifier or re-sending a missed day:
 standup-echo trigger --channel m2                   # target the newest m2 thread
 standup-echo trigger --channel m2 --date 2026-08-13
 standup-echo trigger --channel m2 --user U0123456   # limit delivery to one person
+standup-echo trigger --channel m2 --reminder        # rehearse the mid-day reminder
 ```
 
 `--channel` takes a channel ID or the configured `name`, and is required when more
@@ -153,6 +213,15 @@ access, identifier matching, and reply collection:
 standup-echo trigger --channel m2 --user UDRYRUN00000
 ```
 
+`--reminder` sends the mid-day nudge instead of the echo, without waiting for the
+timer and without consulting the sent-reminder table, so it can be run repeatedly.
+Pair it with `--user` to keep a test to yourself:
+
+```bash
+standup-echo trigger --channel m1 --reminder --user U0123456
+```
+
 Every run logs a summary line — `finished sending DMs sent=N skipped_not_subscribed=N
-failed=N` — so a run that delivers nothing explains itself rather than looking broken.
-The most common cause of `sent=0` is a recipient who hasn't sent `subscribe`.
+failed=N`, or `finished sending reminders ...` — so a run that delivers nothing
+explains itself rather than looking broken. The most common cause of `sent=0` is a
+recipient who hasn't sent `subscribe`.

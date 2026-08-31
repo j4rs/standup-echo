@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testChannels() []ChannelConfig {
@@ -248,5 +249,148 @@ func TestValidate(t *testing.T) {
 				t.Errorf("Validate() should return error when %s is missing", tt.field)
 			}
 		})
+	}
+}
+
+// An absent max_missed_standups must not read as zero grace, which would
+// restore the bug where one missed standup silences the bot for good.
+func TestMissedStandupGraceDefaultsWhenUnset(t *testing.T) {
+	cfg := &Config{SlackBotToken: "x", SlackAppToken: "x", Channels: testChannels()}
+	if got := cfg.MissedStandupGrace(); got != defaultMaxMissedStandups {
+		t.Errorf("MissedStandupGrace() = %d, want the default %d", got, defaultMaxMissedStandups)
+	}
+	if defaultMaxMissedStandups < 1 {
+		t.Errorf("defaultMaxMissedStandups = %d, want at least 1 so a missed day recovers", defaultMaxMissedStandups)
+	}
+}
+
+// An explicit 0 is a deliberate opt-out of the grace window and must survive
+// the round trip distinguishable from "unset".
+func TestMissedStandupGraceHonoursExplicitZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	zero := 0
+	original := &Config{
+		SlackBotToken:     "xoxb-test",
+		SlackAppToken:     "xapp-test",
+		Channels:          testChannels(),
+		MaxMissedStandups: &zero,
+	}
+	if err := Save(path, original); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.MaxMissedStandups == nil {
+		t.Fatal("MaxMissedStandups = nil after round trip, want an explicit 0")
+	}
+	if got := loaded.MissedStandupGrace(); got != 0 {
+		t.Errorf("MissedStandupGrace() = %d, want 0", got)
+	}
+}
+
+func TestMissedStandupGraceHonoursExplicitValue(t *testing.T) {
+	five := 5
+	cfg := &Config{MaxMissedStandups: &five}
+	if got := cfg.MissedStandupGrace(); got != 5 {
+		t.Errorf("MissedStandupGrace() = %d, want 5", got)
+	}
+}
+
+func TestValidateRejectsNegativeMaxMissedStandups(t *testing.T) {
+	negative := -1
+	cfg := &Config{
+		SlackBotToken:     "x",
+		SlackAppToken:     "x",
+		Channels:          testChannels(),
+		MaxMissedStandups: &negative,
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() = nil, want an error for a negative allowance")
+	}
+	if !strings.Contains(err.Error(), "max_missed_standups") {
+		t.Errorf("Validate() error = %q, want it to name max_missed_standups", err)
+	}
+}
+
+// An unset reminder_after must enable reminders at the default delay, not
+// silently disable the feature.
+func TestReminderDelayDefaultsWhenUnset(t *testing.T) {
+	cfg := &Config{SlackBotToken: "x", SlackAppToken: "x", Channels: testChannels()}
+	got, enabled := cfg.ReminderDelay()
+	if !enabled {
+		t.Error("ReminderDelay() enabled = false, want true when unset")
+	}
+	if got != defaultReminderAfter {
+		t.Errorf("ReminderDelay() = %v, want the default %v", got, defaultReminderAfter)
+	}
+}
+
+func TestReminderDelayParsesAndDisables(t *testing.T) {
+	tests := []struct {
+		in          string
+		want        time.Duration
+		wantEnabled bool
+	}{
+		{"4h", 4 * time.Hour, true},
+		{"90m", 90 * time.Minute, true},
+		{"3h30m", 3*time.Hour + 30*time.Minute, true},
+		{"0", 0, false},
+		{"0s", 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			cfg := &Config{ReminderAfter: tt.in}
+			got, enabled := cfg.ReminderDelay()
+			if enabled != tt.wantEnabled {
+				t.Errorf("ReminderDelay(%q) enabled = %v, want %v", tt.in, enabled, tt.wantEnabled)
+			}
+			if enabled && got != tt.want {
+				t.Errorf("ReminderDelay(%q) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// A typo must fail loudly at load rather than quietly turning reminders off.
+func TestValidateRejectsUnparseableReminderAfter(t *testing.T) {
+	for _, bad := range []string{"4 hours", "later", "4", "-"} {
+		cfg := &Config{
+			SlackBotToken: "x",
+			SlackAppToken: "x",
+			Channels:      testChannels(),
+			ReminderAfter: bad,
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Errorf("Validate() with reminder_after %q = nil, want an error", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "reminder_after") {
+			t.Errorf("Validate() error = %q, want it to name reminder_after", err)
+		}
+	}
+}
+
+func TestReminderAfterSurvivesRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yml")
+	original := &Config{
+		SlackBotToken: "xoxb-test",
+		SlackAppToken: "xapp-test",
+		Channels:      testChannels(),
+		ReminderAfter: "4h",
+	}
+	if err := Save(path, original); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ReminderAfter != "4h" {
+		t.Errorf("ReminderAfter = %q after round trip, want %q", loaded.ReminderAfter, "4h")
 	}
 }

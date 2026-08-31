@@ -17,19 +17,38 @@ type Service struct {
 	client           *slack.Client
 	channelID        string
 	threadIdentifier string
+	maxMissed        int
 	subscribers      *store.Subscribers
 	logger           *slog.Logger
 }
 
-// NewService creates a new standup Service.
-func NewService(client *slack.Client, channelID, threadIdentifier string, subscribers *store.Subscribers, logger *slog.Logger) *Service {
+// NewService creates a new standup Service. maxMissed is how many consecutive
+// standups a subscriber may miss and still be nudged; see lookbackThreads.
+func NewService(client *slack.Client, channelID, threadIdentifier string, maxMissed int, subscribers *store.Subscribers, logger *slog.Logger) *Service {
 	return &Service{
 		client:           client,
 		channelID:        channelID,
 		threadIdentifier: threadIdentifier,
+		maxMissed:        maxMissed,
 		subscribers:      subscribers,
 		logger:           logger,
 	}
+}
+
+// lookbackThreads converts a missed-standup allowance into the number of
+// preceding threads to scan: the one just before this standup, plus one more
+// for each standup a subscriber is allowed to have missed.
+//
+// The allowance exists because the DM is what prompts the next update, so
+// keying delivery solely off the immediately-preceding thread makes a single
+// missed day self-perpetuating: no reply Wednesday means no nudge Thursday,
+// which means no reply Thursday. Scanning back further breaks that loop while
+// still letting a genuine absence fall out of the window and go quiet.
+func lookbackThreads(maxMissed int) int {
+	if maxMissed < 1 {
+		return 1
+	}
+	return maxMissed + 1
 }
 
 // historyLookback bounds how far back a history scan will page. Without a
@@ -51,9 +70,15 @@ func previousThreadWindow(currentTS string, now time.Time) (oldest, latest strin
 	return timeToTS(ref.Add(-historyLookback)), currentTS
 }
 
-// FindPreviousStandupThread scans channel history for the most recent parent
-// message matching the thread identifier that is older than currentTS.
-func (s *Service) FindPreviousStandupThread(currentTS string) (string, error) {
+// FindPreviousStandupThreads scans channel history for up to limit parent
+// messages matching the thread identifier that are older than currentTS,
+// returned newest first. It reports an error only when the channel yields no
+// preceding thread at all; finding fewer than limit is normal in a young
+// channel or after a holiday break.
+func (s *Service) FindPreviousStandupThreads(currentTS string, limit int) ([]string, error) {
+	if limit < 1 {
+		limit = 1
+	}
 	oldest, latest := previousThreadWindow(currentTS, time.Now())
 	params := &slack.GetConversationHistoryParameters{
 		ChannelID: s.channelID,
@@ -64,19 +89,25 @@ func (s *Service) FindPreviousStandupThread(currentTS string) (string, error) {
 		Latest: latest,
 	}
 
-	for {
+	// conversations.history returns newest first, so appending in scan order
+	// keeps found[0] as the immediately-preceding thread.
+	var found []string
+	for len(found) < limit {
 		history, err := s.client.GetConversationHistory(params)
 		if err != nil {
-			return "", fmt.Errorf("fetching channel history: %w", err)
+			return nil, fmt.Errorf("fetching channel history: %w", err)
 		}
 
 		for _, msg := range history.Messages {
 			if msg.Timestamp == currentTS {
 				continue
 			}
-			if strings.Contains(msg.Text, s.threadIdentifier) {
-				s.logger.Info("found previous standup thread", "ts", msg.Timestamp)
-				return msg.Timestamp, nil
+			if !strings.Contains(msg.Text, s.threadIdentifier) {
+				continue
+			}
+			found = append(found, msg.Timestamp)
+			if len(found) == limit {
+				break
 			}
 		}
 
@@ -86,7 +117,48 @@ func (s *Service) FindPreviousStandupThread(currentTS string) (string, error) {
 		params.Cursor = history.ResponseMetaData.NextCursor
 	}
 
-	return "", fmt.Errorf("no previous standup thread found in the last %d days", int(historyLookback.Hours()/24))
+	if len(found) == 0 {
+		return nil, fmt.Errorf("no previous standup thread found in the last %d days", int(historyLookback.Hours()/24))
+	}
+	s.logger.Info("found previous standup threads", "count", len(found), "newest", found[0])
+	return found, nil
+}
+
+// collectRecentReplies unions the replies across threadTSs, which must be
+// ordered newest first, keeping each user's most recent update. A user who
+// replied two standups ago is therefore still echoed their own last words
+// rather than an empty prompt.
+func (s *Service) collectRecentReplies(threadTSs []string) (map[string]string, error) {
+	perThread := make([]map[string]string, 0, len(threadTSs))
+	for i, ts := range threadTSs {
+		replies, err := s.GetThreadReplies(ts)
+		if err != nil {
+			// The immediately-preceding thread is the one that matters; losing
+			// it is a real failure. Older threads only widen the grace window,
+			// so a failure there degrades the nudge rather than blocking it.
+			if i == 0 {
+				return nil, err
+			}
+			s.logger.Warn("skipping older standup thread", "thread_ts", ts, "error", err)
+			continue
+		}
+		perThread = append(perThread, replies)
+	}
+	return mergeReplies(perThread), nil
+}
+
+// mergeReplies folds per-thread reply maps, newest first, so the first entry
+// seen for a user wins.
+func mergeReplies(perThread []map[string]string) map[string]string {
+	merged := make(map[string]string)
+	for _, replies := range perThread {
+		for user, reply := range replies {
+			if _, seen := merged[user]; !seen {
+				merged[user] = reply
+			}
+		}
+	}
+	return merged
 }
 
 // GetThreadReplies fetches all replies for a thread, deduplicates by user
@@ -283,18 +355,21 @@ func (s *Service) ProcessNewStandup(newThreadTS string) {
 	s.echoPreviousInto(newThreadTS, "")
 }
 
-// echoPreviousInto DMs each subscriber their reply from the thread preceding
-// newThreadTS, linking newThreadTS. When onlyUser is non-empty, delivery is
-// limited to that user. Both the live path and the manual trigger go through
-// here so a trigger run is a faithful rehearsal rather than an approximation.
+// echoPreviousInto DMs each subscriber their most recent update drawn from the
+// standup threads preceding newThreadTS, linking newThreadTS. It looks back
+// past the immediately-preceding thread by the configured grace allowance, so
+// missing one standup does not silence the nudge that prompts the next one.
+// When onlyUser is non-empty, delivery is limited to that user. Both the live
+// path and the manual trigger go through here so a trigger run is a faithful
+// rehearsal rather than an approximation.
 func (s *Service) echoPreviousInto(newThreadTS, onlyUser string) {
-	prevTS, err := s.FindPreviousStandupThread(newThreadTS)
+	prevTSs, err := s.FindPreviousStandupThreads(newThreadTS, lookbackThreads(s.maxMissed))
 	if err != nil {
 		s.logger.Warn("no previous standup thread found", "error", err)
 		return
 	}
 
-	replies, err := s.GetThreadReplies(prevTS)
+	replies, err := s.collectRecentReplies(prevTSs)
 	if err != nil {
 		s.logger.Error("failed to get thread replies", "error", err)
 		return
@@ -303,13 +378,13 @@ func (s *Service) echoPreviousInto(newThreadTS, onlyUser string) {
 	if onlyUser != "" {
 		reply, ok := replies[onlyUser]
 		if !ok {
-			s.logger.Info("user has no reply in the previous thread", "user", onlyUser, "thread_ts", prevTS)
+			s.logger.Info("user has no reply in the recent standup threads", "user", onlyUser, "threads", len(prevTSs))
 			return
 		}
 		replies = map[string]string{onlyUser: reply}
 	}
 	if len(replies) == 0 {
-		s.logger.Info("no replies in previous standup thread")
+		s.logger.Info("no replies in the recent standup threads", "threads", len(prevTSs))
 		return
 	}
 
